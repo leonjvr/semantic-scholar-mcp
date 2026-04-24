@@ -52,29 +52,48 @@ function persistTime(t: number): void {
 
 // Initialize from persisted state so we respect timing across restarts
 let nextAllowedTime = readPersistedTime();
+let queueDepth = 0;
 
-async function enforceRateLimit(): Promise<void> {
+interface RateLimitInfo {
+  queued: boolean;
+  waitMs: number;
+  queuePosition: number;
+}
+
+async function enforceRateLimit(): Promise<RateLimitInfo> {
   const now = Date.now();
+  queueDepth++;
+  const position = queueDepth;
+
   if (nextAllowedTime <= now) {
     // No wait needed, but reserve the next slot
     nextAllowedTime = now + MIN_REQUEST_INTERVAL_MS;
     persistTime(nextAllowedTime);
-    return;
+    queueDepth--;
+    return { queued: false, waitMs: 0, queuePosition: 0 };
   }
   // Wait until our reserved slot
   const waitTime = nextAllowedTime - now;
   nextAllowedTime += MIN_REQUEST_INTERVAL_MS;
   persistTime(nextAllowedTime);
   await new Promise((resolve) => setTimeout(resolve, waitTime));
+  queueDepth--;
+  return { queued: true, waitMs: waitTime, queuePosition: position };
 }
 
 // --- HTTP helper ---
 
+interface ApiResult {
+  data: unknown;
+  rateLimitInfo: RateLimitInfo;
+  retries: number;
+}
+
 async function apiRequest(
   url: string,
   options: { method?: string; body?: unknown; params?: Record<string, string | undefined> } = {}
-): Promise<unknown> {
-  await enforceRateLimit();
+): Promise<ApiResult> {
+  const rateLimitInfo = await enforceRateLimit();
   const { method = "GET", body, params } = options;
   const u = new URL(url);
   if (params) {
@@ -94,8 +113,10 @@ async function apiRequest(
   }
 
   let lastRes: Response | undefined;
+  let retries = 0;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
+      retries = attempt;
       // Exponential backoff: 3s, 6s, 12s, 24s, 48s
       const backoff = MIN_REQUEST_INTERVAL_MS * Math.pow(2, attempt - 1);
       await new Promise((resolve) => setTimeout(resolve, backoff));
@@ -118,29 +139,53 @@ async function apiRequest(
   const res = lastRes!;
 
   if (res.status === 429) {
-    return { error: true, status: 429, message: RATE_LIMIT_MESSAGE + " (Retried " + MAX_RETRIES + " times with exponential backoff, still rate limited.)" };
+    return { data: { error: true, status: 429, message: RATE_LIMIT_MESSAGE + " (Retried " + MAX_RETRIES + " times with exponential backoff, still rate limited.)" }, rateLimitInfo, retries };
   }
   if (res.status === 403) {
     return {
-      error: true,
-      status: 403,
-      message:
-        "Authentication error. Your API key may be invalid or expired. Request a new key at: https://www.semanticscholar.org/product/api#api-key-form",
+      data: {
+        error: true,
+        status: 403,
+        message:
+          "Authentication error. Your API key may be invalid or expired. Request a new key at: https://www.semanticscholar.org/product/api#api-key-form",
+      },
+      rateLimitInfo,
+      retries,
     };
   }
   if (!res.ok) {
     const text = await res.text();
-    return { error: true, status: res.status, message: text };
+    return { data: { error: true, status: res.status, message: text }, rateLimitInfo, retries };
   }
 
-  return res.json();
+  return { data: await res.json(), rateLimitInfo, retries };
 }
 
-function formatResult(data: unknown): string {
-  if (data && typeof data === "object" && "error" in (data as Record<string, unknown>)) {
-    return JSON.stringify(data, null, 2);
+function formatResult(result: ApiResult): string {
+  const { data, rateLimitInfo, retries } = result;
+  const parts: string[] = [];
+
+  // Queue/rate limit status header
+  const statusParts: string[] = [];
+  if (rateLimitInfo.queued) {
+    statusParts.push(
+      `Request was queued (position #${rateLimitInfo.queuePosition}, waited ${(rateLimitInfo.waitMs / 1000).toFixed(1)}s)`
+    );
   }
-  return JSON.stringify(data, null, 2);
+  if (retries > 0) {
+    statusParts.push(`Required ${retries} retry(s) due to rate limiting`);
+  }
+  if (queueDepth > 0) {
+    statusParts.push(
+      `${queueDepth} request(s) still queued. Next available slot in ~${((nextAllowedTime - Date.now()) / 1000).toFixed(1)}s. If you are making multiple requests, please wait between calls.`
+    );
+  }
+  if (statusParts.length > 0) {
+    parts.push(`[Rate Limit Status] ${statusParts.join(". ")}.`);
+  }
+
+  parts.push(JSON.stringify(data, null, 2));
+  return parts.join("\n\n");
 }
 
 // --- Paper fields description (shared) ---
