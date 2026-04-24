@@ -21,7 +21,7 @@ An MCP (Model Context Protocol) server that provides access to the [Semantic Sch
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/semantic-scholar-mcp.git
+git clone https://github.com/leonjvr/semantic-scholar-mcp.git
 cd semantic-scholar-mcp
 npm install
 npm run build
