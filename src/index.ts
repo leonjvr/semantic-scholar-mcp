@@ -65,6 +65,12 @@ async function enforceRateLimit(): Promise<RateLimitInfo> {
   queueDepth++;
   const position = queueDepth;
 
+  // Re-read persisted time on every call to coordinate across processes
+  const persisted = readPersistedTime();
+  if (persisted > nextAllowedTime) {
+    nextAllowedTime = persisted;
+  }
+
   if (nextAllowedTime <= now) {
     // No wait needed, but reserve the next slot
     nextAllowedTime = now + MIN_REQUEST_INTERVAL_MS;
@@ -120,10 +126,13 @@ async function apiRequest(
       // Exponential backoff: 3s, 6s, 12s, 24s, 48s
       const backoff = MIN_REQUEST_INTERVAL_MS * Math.pow(2, attempt - 1);
       await new Promise((resolve) => setTimeout(resolve, backoff));
-      // Also push out the next allowed time to avoid immediate follow-up collisions
+      // Re-read persisted time and push out to avoid collisions with other processes
       const now = Date.now();
+      const persisted = readPersistedTime();
+      if (persisted > nextAllowedTime) nextAllowedTime = persisted;
       if (nextAllowedTime < now + MIN_REQUEST_INTERVAL_MS) {
         nextAllowedTime = now + MIN_REQUEST_INTERVAL_MS;
+        persistTime(nextAllowedTime);
       }
     }
 
