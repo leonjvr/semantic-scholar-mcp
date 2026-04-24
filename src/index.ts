@@ -3,6 +3,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const API_BASE = "https://api.semanticscholar.org/graph/v1";
 const RECOMMENDATIONS_BASE = "https://api.semanticscholar.org/recommendations/v1";
@@ -19,21 +22,49 @@ const NO_API_KEY_NOTE =
   "Note: No API key configured. The server is using unauthenticated access with shared rate limits. For better reliability, set the SEMANTIC_SCHOLAR_API_KEY environment variable. Request a free API key at: https://www.semanticscholar.org/product/api#api-key-form";
 
 // --- Rate limiting (queued to handle concurrent tool calls) ---
+// Persists last request timestamp to a temp file so rate limit state
+// survives server restarts and is shared across instances.
 
 const MIN_REQUEST_INTERVAL_MS = 3000;
 const MAX_RETRIES = 5;
-let nextAllowedTime = 0;
+
+const RATE_LIMIT_STATE_DIR = join(tmpdir(), "semantic-scholar-mcp");
+const RATE_LIMIT_STATE_FILE = join(RATE_LIMIT_STATE_DIR, "last-request-time");
+
+function readPersistedTime(): number {
+  try {
+    const raw = readFileSync(RATE_LIMIT_STATE_FILE, "utf-8").trim();
+    const t = Number(raw);
+    return Number.isFinite(t) ? t : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function persistTime(t: number): void {
+  try {
+    mkdirSync(RATE_LIMIT_STATE_DIR, { recursive: true });
+    writeFileSync(RATE_LIMIT_STATE_FILE, String(t), "utf-8");
+  } catch {
+    // Best-effort — don't crash the server if temp dir is unwritable
+  }
+}
+
+// Initialize from persisted state so we respect timing across restarts
+let nextAllowedTime = readPersistedTime();
 
 async function enforceRateLimit(): Promise<void> {
   const now = Date.now();
   if (nextAllowedTime <= now) {
     // No wait needed, but reserve the next slot
     nextAllowedTime = now + MIN_REQUEST_INTERVAL_MS;
+    persistTime(nextAllowedTime);
     return;
   }
   // Wait until our reserved slot
   const waitTime = nextAllowedTime - now;
   nextAllowedTime += MIN_REQUEST_INTERVAL_MS;
+  persistTime(nextAllowedTime);
   await new Promise((resolve) => setTimeout(resolve, waitTime));
 }
 
