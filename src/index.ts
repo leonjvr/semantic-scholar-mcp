@@ -20,7 +20,8 @@ const NO_API_KEY_NOTE =
 
 // --- Rate limiting (queued to handle concurrent tool calls) ---
 
-const MIN_REQUEST_INTERVAL_MS = 2000;
+const MIN_REQUEST_INTERVAL_MS = 3000;
+const MAX_RETRIES = 5;
 let nextAllowedTime = 0;
 
 async function enforceRateLimit(): Promise<void> {
@@ -61,14 +62,32 @@ async function apiRequest(
     headers["Content-Type"] = "application/json";
   }
 
-  const res = await fetch(u.toString(), {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let lastRes: Response | undefined;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      // Exponential backoff: 3s, 6s, 12s, 24s, 48s
+      const backoff = MIN_REQUEST_INTERVAL_MS * Math.pow(2, attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, backoff));
+      // Also push out the next allowed time to avoid immediate follow-up collisions
+      const now = Date.now();
+      if (nextAllowedTime < now + MIN_REQUEST_INTERVAL_MS) {
+        nextAllowedTime = now + MIN_REQUEST_INTERVAL_MS;
+      }
+    }
+
+    lastRes = await fetch(u.toString(), {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+
+    if (lastRes.status !== 429) break;
+  }
+
+  const res = lastRes!;
 
   if (res.status === 429) {
-    return { error: true, status: 429, message: RATE_LIMIT_MESSAGE };
+    return { error: true, status: 429, message: RATE_LIMIT_MESSAGE + " (Retried " + MAX_RETRIES + " times with exponential backoff, still rate limited.)" };
   }
   if (res.status === 403) {
     return {
