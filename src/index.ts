@@ -25,8 +25,8 @@ const NO_API_KEY_NOTE =
 // Persists queue state to a JSON file so rate limit coordination works
 // across server restarts and multiple MCP server instances.
 
-const MIN_REQUEST_INTERVAL_MS = 3000;
-const MAX_RETRIES = 5;
+const MIN_REQUEST_INTERVAL_MS = 5000;
+const MAX_RETRIES = 3;
 
 const RATE_LIMIT_STATE_DIR = join(tmpdir(), "semantic-scholar-mcp");
 const RATE_LIMIT_STATE_FILE = join(RATE_LIMIT_STATE_DIR, "queue-state.json");
@@ -269,11 +269,25 @@ async function apiRequest(
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       retries = attempt;
+
+      // Check for Retry-After header from previous response
+      let retryAfterMs = 0;
+      if (lastRes) {
+        const retryAfter = lastRes.headers.get("retry-after");
+        if (retryAfter) {
+          const secs = Number(retryAfter);
+          if (Number.isFinite(secs) && secs > 0) {
+            retryAfterMs = secs * 1000;
+          }
+        }
+      }
+
       // On 429, apply GLOBAL exponential backoff — pushes entire queue out
       const state = readState();
       const { backoffMs } = applyGlobalBackoff(state);
-      // Wait the backoff period before retrying
-      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      // Use the longer of our backoff or the server's Retry-After
+      const waitMs = Math.max(backoffMs, retryAfterMs);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
 
     lastRes = await fetch(u.toString(), {
