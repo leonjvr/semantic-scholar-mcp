@@ -33,10 +33,13 @@ const RATE_LIMIT_STATE_FILE = join(RATE_LIMIT_STATE_DIR, "queue-state.json");
 
 interface QueueState {
   nextAllowedTime: number;
+  consecutiveRateLimits: number;
+  backoffUntil: number;
   queue: Array<{
     id: string;
     tool: string;
     reservedSlot: number;
+    estimatedCompletion: number;
     createdAt: number;
     pid: number;
   }>;
@@ -46,6 +49,7 @@ interface QueueState {
     requestedAt: number;
     firedAt: number;
     waitedMs: number;
+    retries: number;
     status: "completed" | "rate_limited" | "error";
     pid: number;
   }>;
@@ -60,9 +64,11 @@ function readState(): QueueState {
     // Prune stale queue entries older than 5 minutes (dead processes)
     const staleThreshold = Date.now() - 5 * 60 * 1000;
     parsed.queue = (parsed.queue || []).filter((e) => e.reservedSlot > staleThreshold);
+    parsed.consecutiveRateLimits = parsed.consecutiveRateLimits || 0;
+    parsed.backoffUntil = parsed.backoffUntil || 0;
     return parsed;
   } catch {
-    return { nextAllowedTime: 0, queue: [], history: [] };
+    return { nextAllowedTime: 0, consecutiveRateLimits: 0, backoffUntil: 0, queue: [], history: [] };
   }
 }
 
@@ -83,6 +89,40 @@ function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Push the entire queue out by a backoff amount.
+ * Called when ANY request receives a 429 — shifts all pending slots
+ * and updates backoffUntil so waiting requests see the delay.
+ */
+function applyGlobalBackoff(state: QueueState): { backoffMs: number } {
+  state.consecutiveRateLimits++;
+  // Exponential backoff: 3s, 6s, 12s, 24s, 48s, 96s...
+  const backoffMs = MIN_REQUEST_INTERVAL_MS * Math.pow(2, state.consecutiveRateLimits - 1);
+  const now = Date.now();
+  const newBackoffUntil = now + backoffMs;
+  state.backoffUntil = newBackoffUntil;
+
+  // Push out nextAllowedTime
+  if (state.nextAllowedTime < newBackoffUntil) {
+    state.nextAllowedTime = newBackoffUntil;
+  }
+
+  // Shift ALL queued entries: redistribute evenly after backoffUntil
+  if (state.queue.length > 0) {
+    state.queue.sort((a, b) => a.reservedSlot - b.reservedSlot);
+    let slot = newBackoffUntil;
+    for (const entry of state.queue) {
+      slot += MIN_REQUEST_INTERVAL_MS;
+      entry.reservedSlot = slot;
+      entry.estimatedCompletion = slot + 2000; // ~2s for the API call itself
+    }
+    state.nextAllowedTime = slot;
+  }
+
+  writeState(state);
+  return { backoffMs };
+}
+
 // In-memory queue depth for this process
 let localQueueDepth = 0;
 
@@ -92,6 +132,7 @@ interface RateLimitInfo {
   queuePosition: number;
   totalQueued: number;
   requestId: string;
+  estimatedCompletion: number;
 }
 
 async function enforceRateLimit(toolName: string): Promise<RateLimitInfo> {
@@ -103,30 +144,50 @@ async function enforceRateLimit(toolName: string): Promise<RateLimitInfo> {
   const state = readState();
 
   // Ensure we use the latest nextAllowedTime from any process
-  let nextSlot = state.nextAllowedTime;
-  if (nextSlot <= now) {
-    nextSlot = now;
-  }
+  let nextSlot = Math.max(state.nextAllowedTime, state.backoffUntil, now);
 
   // Reserve our slot
   const mySlot = nextSlot + MIN_REQUEST_INTERVAL_MS;
-  const waitTime = nextSlot <= now ? 0 : nextSlot - now;
+  const waitTime = mySlot > now ? mySlot - now : 0;
+  const estimatedCompletion = mySlot + 2000; // ~2s for API call
 
   // Register in queue
   state.queue.push({
     id: requestId,
     tool: toolName,
     reservedSlot: mySlot,
+    estimatedCompletion,
     createdAt: now,
     pid: process.pid,
   });
   state.nextAllowedTime = mySlot;
   const totalQueued = state.queue.length;
+  const queuePosition = totalQueued;
   writeState(state);
 
-  // Wait if needed
+  // Wait until our slot, but re-check for backoff shifts before firing
   if (waitTime > 0) {
     await new Promise((resolve) => setTimeout(resolve, waitTime));
+  }
+
+  // Re-read state: another request may have triggered global backoff while we slept
+  const freshState = readState();
+  const myEntry = freshState.queue.find((e) => e.id === requestId);
+  if (myEntry && myEntry.reservedSlot > Date.now()) {
+    // Our slot got pushed out by a global backoff — wait the extra time
+    const extraWait = myEntry.reservedSlot - Date.now();
+    if (extraWait > 0) {
+      await new Promise((resolve) => setTimeout(resolve, extraWait));
+    }
+  }
+
+  // Also respect backoffUntil (in case we weren't in the queue when backoff happened)
+  const stateBeforeFire = readState();
+  if (stateBeforeFire.backoffUntil > Date.now()) {
+    const backoffWait = stateBeforeFire.backoffUntil - Date.now();
+    if (backoffWait > 0) {
+      await new Promise((resolve) => setTimeout(resolve, backoffWait));
+    }
   }
 
   // Remove ourselves from the queue now that we're firing
@@ -135,13 +196,15 @@ async function enforceRateLimit(toolName: string): Promise<RateLimitInfo> {
   writeState(stateAfterWait);
 
   localQueueDepth--;
+  const actualWaitMs = Date.now() - now;
 
   return {
-    queued: waitTime > 0,
-    waitMs: waitTime,
-    queuePosition: totalQueued,
+    queued: actualWaitMs > 100,
+    waitMs: actualWaitMs,
+    queuePosition,
     totalQueued: Math.max(0, stateAfterWait.queue.length),
     requestId,
+    estimatedCompletion,
   };
 }
 
@@ -151,6 +214,7 @@ function recordHistory(
   requestedAt: number,
   firedAt: number,
   waitedMs: number,
+  retries: number,
   status: "completed" | "rate_limited" | "error"
 ): void {
   const state = readState();
@@ -160,6 +224,7 @@ function recordHistory(
     requestedAt,
     firedAt,
     waitedMs,
+    retries,
     status,
     pid: process.pid,
   });
@@ -204,16 +269,11 @@ async function apiRequest(
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       retries = attempt;
-      // Exponential backoff: 3s, 6s, 12s, 24s, 48s
-      const backoff = MIN_REQUEST_INTERVAL_MS * Math.pow(2, attempt - 1);
-      await new Promise((resolve) => setTimeout(resolve, backoff));
-      // Re-read state and push out to avoid collisions with other processes
-      const now = Date.now();
+      // On 429, apply GLOBAL exponential backoff — pushes entire queue out
       const state = readState();
-      if (state.nextAllowedTime < now + MIN_REQUEST_INTERVAL_MS) {
-        state.nextAllowedTime = now + MIN_REQUEST_INTERVAL_MS;
-        writeState(state);
-      }
+      const { backoffMs } = applyGlobalBackoff(state);
+      // Wait the backoff period before retrying
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
     }
 
     lastRes = await fetch(u.toString(), {
@@ -222,18 +282,41 @@ async function apiRequest(
       body: body ? JSON.stringify(body) : undefined,
     });
 
-    if (lastRes.status !== 429) break;
+    if (lastRes.status !== 429) {
+      // Success or non-rate-limit error — reset consecutive counter
+      if (retries > 0) {
+        const state = readState();
+        state.consecutiveRateLimits = 0;
+        state.backoffUntil = 0;
+        writeState(state);
+      }
+      break;
+    }
   }
 
   const res = lastRes!;
   const firedAt = Date.now();
+  const totalWaitMs = firedAt - requestedAt;
 
   if (res.status === 429) {
-    recordHistory(rateLimitInfo.requestId, toolName, requestedAt, firedAt, rateLimitInfo.waitMs, "rate_limited");
-    return { data: { error: true, status: 429, message: RATE_LIMIT_MESSAGE + " (Retried " + MAX_RETRIES + " times with exponential backoff, still rate limited.)" }, rateLimitInfo, retries };
+    recordHistory(rateLimitInfo.requestId, toolName, requestedAt, firedAt, totalWaitMs, retries, "rate_limited");
+    // Read fresh state to report updated ETAs to the agent
+    const freshState = readState();
+    const queueReport = freshState.queue.length > 0
+      ? `\n\nQueued requests have been pushed back. Current backoff level: ${freshState.consecutiveRateLimits} (${((freshState.backoffUntil - Date.now()) / 1000).toFixed(1)}s until next attempt allowed).`
+      : "";
+    return {
+      data: {
+        error: true,
+        status: 429,
+        message: RATE_LIMIT_MESSAGE + ` (Retried ${MAX_RETRIES} times with global exponential backoff, still rate limited. All queued requests have been pushed out.)` + queueReport,
+      },
+      rateLimitInfo,
+      retries,
+    };
   }
   if (res.status === 403) {
-    recordHistory(rateLimitInfo.requestId, toolName, requestedAt, firedAt, rateLimitInfo.waitMs, "error");
+    recordHistory(rateLimitInfo.requestId, toolName, requestedAt, firedAt, totalWaitMs, retries, "error");
     return {
       data: {
         error: true,
@@ -247,11 +330,19 @@ async function apiRequest(
   }
   if (!res.ok) {
     const text = await res.text();
-    recordHistory(rateLimitInfo.requestId, toolName, requestedAt, firedAt, rateLimitInfo.waitMs, "error");
+    recordHistory(rateLimitInfo.requestId, toolName, requestedAt, firedAt, totalWaitMs, retries, "error");
     return { data: { error: true, status: res.status, message: text }, rateLimitInfo, retries };
   }
 
-  recordHistory(rateLimitInfo.requestId, toolName, requestedAt, firedAt, rateLimitInfo.waitMs, "completed");
+  // On success, reset consecutive rate limits
+  const successState = readState();
+  if (successState.consecutiveRateLimits > 0) {
+    successState.consecutiveRateLimits = 0;
+    successState.backoffUntil = 0;
+    writeState(successState);
+  }
+
+  recordHistory(rateLimitInfo.requestId, toolName, requestedAt, firedAt, totalWaitMs, retries, "completed");
   return { data: await res.json(), rateLimitInfo, retries };
 }
 
@@ -267,24 +358,33 @@ function formatResult(result: ApiResult): string {
     );
   }
   if (retries > 0) {
-    statusParts.push(`Required ${retries} retry(s) due to rate limiting`);
+    statusParts.push(`Required ${retries} retry(s) due to rate limiting (global backoff applied to entire queue)`);
   }
 
   // Read current queue state to report what's pending and when
   const currentState = readState();
+
+  // Report backoff state
+  if (currentState.consecutiveRateLimits > 0) {
+    const backoffRemaining = Math.max(0, (currentState.backoffUntil - Date.now()) / 1000);
+    statusParts.push(
+      `Global backoff active (level ${currentState.consecutiveRateLimits}, ${backoffRemaining.toFixed(1)}s remaining). All queued requests have been pushed back.`
+    );
+  }
+
   if (currentState.queue.length > 0) {
     const now = Date.now();
-    const pendingInfo = currentState.queue
-      .sort((a, b) => a.reservedSlot - b.reservedSlot)
+    const sorted = currentState.queue.sort((a, b) => a.reservedSlot - b.reservedSlot);
+    const pendingInfo = sorted
       .map((entry, i) => {
         const etaSec = Math.max(0, (entry.reservedSlot - now) / 1000);
         return `  ${i + 1}. ${entry.tool} (PID ${entry.pid}) — fires in ~${etaSec.toFixed(1)}s`;
       })
       .join("\n");
-    const lastSlot = currentState.queue[currentState.queue.length - 1]?.reservedSlot || now;
+    const lastSlot = sorted[sorted.length - 1]?.reservedSlot || now;
     const totalWaitSec = Math.max(0, (lastSlot - now) / 1000);
     statusParts.push(
-      `${currentState.queue.length} request(s) still in queue (estimated ${totalWaitSec.toFixed(1)}s until all complete):\n${pendingInfo}\nIf you are making additional requests, the next available slot is in ~${totalWaitSec.toFixed(1)}s. Please space your calls accordingly.`
+      `${currentState.queue.length} request(s) still in queue (estimated ${totalWaitSec.toFixed(1)}s until all complete):\n${pendingInfo}\nNext available slot: ~${totalWaitSec.toFixed(1)}s. Space your calls accordingly or use queue_status to check progress.`
     );
   }
 
@@ -310,6 +410,111 @@ const server = new McpServer({
   name: "semantic-scholar",
   version: "1.0.0",
 });
+
+// 0. Queue Status (rate limit monitoring tool)
+server.tool(
+  "queue_status",
+  "Check the current rate limit queue status. Shows pending requests, their position, estimated processing times, backoff state, and recent request history. Use this to know when your request will be processed or when it is safe to make another call.",
+  {
+    request_id: z.string().optional().describe("Optional: a specific request ID to look up (returned in previous tool responses)"),
+  },
+  async ({ request_id }) => {
+    const state = readState();
+    const now = Date.now();
+
+    const status: Record<string, unknown> = {
+      currentTime: new Date(now).toISOString(),
+      nextAllowedSlot: new Date(Math.max(state.nextAllowedTime, now)).toISOString(),
+      timeUntilNextSlot: `${Math.max(0, (state.nextAllowedTime - now) / 1000).toFixed(1)}s`,
+    };
+
+    // Backoff state
+    if (state.consecutiveRateLimits > 0) {
+      const backoffRemaining = Math.max(0, (state.backoffUntil - now) / 1000);
+      status.backoff = {
+        active: true,
+        level: state.consecutiveRateLimits,
+        backoffUntil: new Date(state.backoffUntil).toISOString(),
+        remainingSeconds: Number(backoffRemaining.toFixed(1)),
+        message: `Global backoff active due to ${state.consecutiveRateLimits} consecutive rate limit(s). All requests delayed by ${backoffRemaining.toFixed(1)}s.`,
+      };
+    } else {
+      status.backoff = { active: false, level: 0, message: "No backoff active. Requests are flowing normally." };
+    }
+
+    // Pending queue
+    const sorted = state.queue.sort((a, b) => a.reservedSlot - b.reservedSlot);
+    status.pendingRequests = sorted.map((entry, i) => {
+      const firesIn = Math.max(0, (entry.reservedSlot - now) / 1000);
+      const completesIn = Math.max(0, (entry.estimatedCompletion - now) / 1000);
+      return {
+        position: i + 1,
+        id: entry.id,
+        tool: entry.tool,
+        pid: entry.pid,
+        firesAt: new Date(entry.reservedSlot).toISOString(),
+        firesInSeconds: Number(firesIn.toFixed(1)),
+        estimatedCompletionAt: new Date(entry.estimatedCompletion).toISOString(),
+        estimatedCompletionInSeconds: Number(completesIn.toFixed(1)),
+        waitingSince: new Date(entry.createdAt).toISOString(),
+        totalWaitSeconds: Number(((now - entry.createdAt) / 1000).toFixed(1)),
+      };
+    });
+    status.totalPending = sorted.length;
+
+    // Specific request lookup
+    if (request_id) {
+      const inQueue = sorted.find((e) => e.id === request_id);
+      if (inQueue) {
+        const firesIn = Math.max(0, (inQueue.reservedSlot - now) / 1000);
+        status.yourRequest = {
+          found: true,
+          status: "queued",
+          id: inQueue.id,
+          tool: inQueue.tool,
+          position: sorted.indexOf(inQueue) + 1,
+          firesInSeconds: Number(firesIn.toFixed(1)),
+          firesAt: new Date(inQueue.reservedSlot).toISOString(),
+          message: `Your request is #${sorted.indexOf(inQueue) + 1} in queue. It will fire in ~${firesIn.toFixed(1)}s.`,
+        };
+      } else {
+        // Check history
+        const inHistory = state.history.find((e) => e.id === request_id);
+        if (inHistory) {
+          status.yourRequest = {
+            found: true,
+            status: inHistory.status,
+            id: inHistory.id,
+            tool: inHistory.tool,
+            firedAt: new Date(inHistory.firedAt).toISOString(),
+            waitedSeconds: Number((inHistory.waitedMs / 1000).toFixed(1)),
+            retries: inHistory.retries,
+            message: `Your request completed with status: ${inHistory.status}. It waited ${(inHistory.waitedMs / 1000).toFixed(1)}s and required ${inHistory.retries} retry(s).`,
+          };
+        } else {
+          status.yourRequest = {
+            found: false,
+            message: `Request ID "${request_id}" not found in queue or recent history.`,
+          };
+        }
+      }
+    }
+
+    // Recent history (last 10)
+    status.recentHistory = state.history.slice(-10).reverse().map((entry) => ({
+      id: entry.id,
+      tool: entry.tool,
+      status: entry.status,
+      requestedAt: new Date(entry.requestedAt).toISOString(),
+      firedAt: new Date(entry.firedAt).toISOString(),
+      waitedSeconds: Number((entry.waitedMs / 1000).toFixed(1)),
+      retries: entry.retries,
+      pid: entry.pid,
+    }));
+
+    return { content: [{ type: "text" as const, text: JSON.stringify(status, null, 2) }] };
+  }
+);
 
 // 1. Paper Relevance Search
 server.tool(
