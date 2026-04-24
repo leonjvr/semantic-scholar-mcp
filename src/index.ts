@@ -18,18 +18,22 @@ const RATE_LIMIT_MESSAGE = `Rate limited by Semantic Scholar API. ${
 const NO_API_KEY_NOTE =
   "Note: No API key configured. The server is using unauthenticated access with shared rate limits. For better reliability, set the SEMANTIC_SCHOLAR_API_KEY environment variable. Request a free API key at: https://www.semanticscholar.org/product/api#api-key-form";
 
-// --- Rate limiting ---
+// --- Rate limiting (queued to handle concurrent tool calls) ---
 
 const MIN_REQUEST_INTERVAL_MS = 2000;
-let lastRequestTime = 0;
+let nextAllowedTime = 0;
 
 async function enforceRateLimit(): Promise<void> {
   const now = Date.now();
-  const elapsed = now - lastRequestTime;
-  if (elapsed < MIN_REQUEST_INTERVAL_MS) {
-    await new Promise((resolve) => setTimeout(resolve, MIN_REQUEST_INTERVAL_MS - elapsed));
+  if (nextAllowedTime <= now) {
+    // No wait needed, but reserve the next slot
+    nextAllowedTime = now + MIN_REQUEST_INTERVAL_MS;
+    return;
   }
-  lastRequestTime = Date.now();
+  // Wait until our reserved slot
+  const waitTime = nextAllowedTime - now;
+  nextAllowedTime += MIN_REQUEST_INTERVAL_MS;
+  await new Promise((resolve) => setTimeout(resolve, waitTime));
 }
 
 // --- HTTP helper ---
